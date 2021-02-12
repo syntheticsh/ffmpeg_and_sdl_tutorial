@@ -33,26 +33,26 @@ fn main() -> Result<()> {
             .ok_or_else(|| anyhow!("no input specified"))?,
     ) {
         // даелее мы смотрим доступные потоки, конкретно тут мы ищем "лучший" видео поток
-        let input = ictx
+        let video_input = ictx
             .streams()
             .best(Type::Video)
             .ok_or(ffmpeg::Error::StreamNotFound)?;
         // дальше находим лучший аудио поток
-        let a_input = ictx
+        let audio_input = ictx
             .streams()
             .best(Type::Audio)
             .ok_or(ffmpeg::Error::StreamNotFound)?;
 
-        let video_stream_index = input.index();
-        let audio_stream_index = a_input.index();
+        let video_stream_index = video_input.index();
+        let audio_stream_index = audio_input.index();
 
         // находим декодер (кодек) по id видео потока
         // под копотом в функции .video() вызывает avcodec_find_decoder()
         // и потом открывается сам коде через avcodec_open2()
-        let mut decoder = input.codec().decoder().video()?;
+        let video_decoder = video_input.codec().decoder().video()?;
 
         // находим так же и кодек аудио
-        let mut a_decoder = a_input.codec().decoder().audio()?;
+        let audio_decoder = audio_input.codec().decoder().audio()?;
 
         // по сути какой-то синглтон который следит за тем что бы у нас не было несколько контекстов
         let sdl_context = sdl2::init().map_err(|e| anyhow!(e))?;
@@ -62,7 +62,11 @@ fn main() -> Result<()> {
 
         // создаём окно в котором будем отображать информацию
         let window = video_subsystem
-            .window("rust-sdl2 demo: Video", decoder.width(), decoder.height())
+            .window(
+                "rust-sdl2 demo: Video",
+                video_decoder.width(),
+                video_decoder.height(),
+            )
             .position_centered()
             .opengl()
             .build()
@@ -76,8 +80,8 @@ fn main() -> Result<()> {
         let texture_creator = canvas.texture_creator();
 
         let desired_spec = AudioSpecDesired {
-            freq: Some(a_decoder.rate() as i32),
-            channels: Some(a_decoder.channels() as u8),
+            freq: Some(audio_decoder.rate() as i32),
+            channels: Some(audio_decoder.channels() as u8),
             samples: Some(4),
         };
 
@@ -94,8 +98,8 @@ fn main() -> Result<()> {
         let (decoded_tx, decoded_rx) = std::sync::mpsc::channel();
 
         let ph = packet_receiver(
-            decoder,
-            a_decoder,
+            video_decoder,
+            audio_decoder,
             decoded_tx,
             ictx,
             video_stream_index,
@@ -124,22 +128,21 @@ fn main() -> Result<()> {
                         ..
                     } => {
                         break_flag.lock().map(|_| true);
+                        ph.join();
                         break;
                     }
                     _ => {}
                 }
             }
         }
-
-        ph.join();
     }
 
     Ok(())
 }
 
 fn packet_receiver(
-    mut decoder: ffmpeg::codec::decoder::Video,
-    mut a_decoder: ffmpeg::codec::decoder::Audio,
+    video_decoder: ffmpeg::codec::decoder::Video,
+    audio_decoder: ffmpeg::codec::decoder::Audio,
     decoded_tx: std::sync::mpsc::Sender<DecodeResult>,
     mut ictx: ffmpeg::format::context::Input,
     video_stream_index: usize,
@@ -147,20 +150,20 @@ fn packet_receiver(
     break_flag: std::sync::Arc<std::sync::Mutex<bool>>,
 ) -> std::thread::JoinHandle<Result<()>> {
     std::thread::spawn(move || -> Result<()> {
-        let (a_tx, a_rx) = std::sync::mpsc::channel();
-        let (v_tx, v_rx) = std::sync::mpsc::channel();
+        let (audio_tx, audio_rx) = std::sync::mpsc::channel();
+        let (video_tx, video_rx) = std::sync::mpsc::channel();
 
-        let va = audio_thread(a_decoder, a_rx, decoded_tx.clone());
-        let vh = video_thread(decoder, v_rx, decoded_tx);
+        let audio_thread_handle = audio_thread(audio_decoder, audio_rx, decoded_tx.clone());
+        let video_thread_handle = video_thread(video_decoder, video_rx, decoded_tx);
 
         // читаем все пакеты из потока через av_read_frame()
         for (stream, packet) in ictx.packets() {
             let packet = std::sync::Arc::new(packet);
             // если пакет относится к видео
             if stream.index() == video_stream_index {
-                v_tx.send(packet).unwrap_or(());
+                video_tx.send(packet).unwrap_or(());
             } else if stream.index() == audio_stream_index {
-                a_tx.send(packet).unwrap_or(());
+                audio_tx.send(packet).unwrap_or(());
             }
 
             if *break_flag.lock().unwrap() {
@@ -168,11 +171,11 @@ fn packet_receiver(
             }
         }
 
-        drop(a_tx);
-        drop(v_tx);
+        drop(audio_tx);
+        drop(video_tx);
 
-        va.join();
-        vh.join();
+        audio_thread_handle.join();
+        video_thread_handle.join();
 
         Ok(())
     })
@@ -180,7 +183,7 @@ fn packet_receiver(
 
 fn video_thread(
     mut decoder: ffmpeg::codec::decoder::Video,
-    v_rx: std::sync::mpsc::Receiver<std::sync::Arc<ffmpeg::codec::packet::Packet>>,
+    video_rx: std::sync::mpsc::Receiver<std::sync::Arc<ffmpeg::codec::packet::Packet>>,
     result_tx: std::sync::mpsc::Sender<DecodeResult>,
 ) -> std::thread::JoinHandle<Result<()>> {
     std::thread::spawn(move || -> Result<()> {
@@ -214,7 +217,7 @@ fn video_thread(
                 Ok(())
             };
 
-        while let Ok(packet) = v_rx.recv() {
+        while let Ok(packet) = video_rx.recv() {
             // посылаем пакет в декодер avcodec_send_packet()
             decoder.send_packet(&*packet)?;
             receive_and_process_decoded_frames(&mut decoder)?;
@@ -226,18 +229,18 @@ fn video_thread(
 }
 
 fn audio_thread(
-    mut a_decoder: ffmpeg::codec::decoder::Audio,
-    a_rx: std::sync::mpsc::Receiver<std::sync::Arc<ffmpeg::codec::packet::Packet>>,
+    mut decoder: ffmpeg::codec::decoder::Audio,
+    audio_rx: std::sync::mpsc::Receiver<std::sync::Arc<ffmpeg::codec::packet::Packet>>,
     result_tx: std::sync::mpsc::Sender<DecodeResult>,
 ) -> std::thread::JoinHandle<Result<()>> {
     std::thread::spawn(move || -> Result<()> {
         let mut a_context = AudioContext::get(
-            a_decoder.format(),
-            a_decoder.channel_layout(),
-            a_decoder.rate(),
+            decoder.format(),
+            decoder.channel_layout(),
+            decoder.rate(),
             Sample::I16(AudioType::Packed),
-            a_decoder.channel_layout(),
-            a_decoder.rate(),
+            decoder.channel_layout(),
+            decoder.rate(),
         )?;
 
         let mut receive_and_process_decoded_frames =
@@ -254,11 +257,11 @@ fn audio_thread(
                 Ok(())
             };
 
-        while let Ok(packet) = a_rx.recv() {
-            a_decoder.send_packet(&*packet)?;
-            receive_and_process_decoded_frames(&mut a_decoder)?;
+        while let Ok(packet) = audio_rx.recv() {
+            decoder.send_packet(&*packet)?;
+            receive_and_process_decoded_frames(&mut decoder)?;
         }
-        a_decoder.send_eof();
+        decoder.send_eof();
 
         Ok(())
     })
