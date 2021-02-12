@@ -21,3 +21,11 @@ path = "src/tut1/main.rs"
 [[bin]]
 name = "tut2"
 path = "src/tut2/main.rs"
+
+[[bin]]
+name = "tut3"
+path = "src/tut3/main.rs"
+
+[[bin]]
+name = "tut4"
+path = "src/tut4/main.rs"
