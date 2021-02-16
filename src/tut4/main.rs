@@ -15,9 +15,8 @@ use sdl2::render::{TextureCreator, WindowCanvas};
 use sdl2::video::WindowContext;
 use std::env;
 
-enum DecodeResult {
-    Audio(Audio),
-    Video(Video),
+struct RenderEvent {
+    a: u32,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -32,6 +31,9 @@ fn main() -> Result<()> {
             .nth(1)
             .ok_or_else(|| anyhow!("no input specified"))?,
     ) {
+        // дамп информации о контексте input'а, тертий параметр не обязательный
+        ffmpeg::format::context::input::dump(&ictx, 0, Some(env::args().nth(1).unwrap().as_str()));
+
         // даелее мы смотрим доступные потоки, конкретно тут мы ищем "лучший" видео поток
         let video_input = ictx
             .streams()
@@ -95,44 +97,71 @@ fn main() -> Result<()> {
 
         let mut event_pump = sdl_context.event_pump().map_err(|e| anyhow!(e))?;
 
-        let (decoded_tx, decoded_rx) = std::sync::mpsc::channel();
+        let (video_decoded_tx, video_decoded_rx) = std::sync::mpsc::sync_channel(8);
+        let (audio_decoded_tx, audio_decoded_rx) = std::sync::mpsc::sync_channel(8);
 
         let ph = packet_receiver(
             video_decoder,
             audio_decoder,
-            decoded_tx,
+            video_decoded_tx,
+            audio_decoded_tx,
             ictx,
             video_stream_index,
             audio_stream_index,
             break_flag.clone(),
         );
 
+        draw_frame(&mut video_decoded_rx.recv()?, &mut canvas, &texture_creator)?;
+
+        let event_subsystem = sdl_context.event().map_err(|e| anyhow!(e))?;
+        event_subsystem
+            .register_custom_event::<RenderEvent>()
+            .unwrap();
+
+        let timer_subsystem = sdl_context.timer().map_err(|e| anyhow!(e))?;
+        let mut timer = timer_subsystem.add_timer(
+            31,
+            Box::new(|| {
+                event_subsystem
+                    .push_custom_event(RenderEvent { a: 42 })
+                    .unwrap();
+                0
+            }),
+        );
+
         loop {
-            let res = decoded_rx.recv()?;
-            match res {
-                DecodeResult::Audio(frame_to_play) => {
-                    audio_device.queue(unsafe { frame_to_play.data(0).align_to::<i16>() }.1);
-                    if !audio_started {
-                        audio_device.resume();
-                    }
-                }
-                DecodeResult::Video(mut frame_to_display) => {
-                    draw_frame(&mut frame_to_display, &mut canvas, &texture_creator).unwrap();
+            if let Ok(frame_to_play) = audio_decoded_rx.try_recv() {
+                audio_device.queue(unsafe { frame_to_play.data(0).align_to::<i16>() }.1);
+                if !audio_started {
+                    audio_device.resume();
                 }
             }
-            if let Some(event) = event_pump.poll_event() {
-                match event {
-                    Event::Quit { .. }
-                    | Event::KeyDown {
-                        keycode: Some(Keycode::Escape),
-                        ..
-                    } => {
-                        break_flag.lock().map(|_| true);
-                        ph.join();
-                        break;
+            match event_pump.poll_event() {
+                Some(event) if event.is_user_event() => {
+                    if let Ok(mut frame_to_display) = video_decoded_rx.try_recv() {
+                        draw_frame(&mut frame_to_display, &mut canvas, &texture_creator).unwrap();
                     }
-                    _ => {}
+
+                    timer = timer_subsystem.add_timer(
+                        31,
+                        Box::new(|| {
+                            event_subsystem
+                                .push_custom_event(RenderEvent { a: 42 })
+                                .unwrap();
+                            0
+                        }),
+                    );
                 }
+                Some(Event::Quit { .. })
+                | Some(Event::KeyDown {
+                    keycode: Some(Keycode::Escape),
+                    ..
+                }) => {
+                    break_flag.lock().map(|_| true);
+                    ph.join();
+                    break;
+                }
+                _ => {}
             }
         }
     }
@@ -143,18 +172,19 @@ fn main() -> Result<()> {
 fn packet_receiver(
     video_decoder: ffmpeg::codec::decoder::Video,
     audio_decoder: ffmpeg::codec::decoder::Audio,
-    decoded_tx: std::sync::mpsc::Sender<DecodeResult>,
+    video_decoded_tx: std::sync::mpsc::SyncSender<Video>,
+    audio_decoder_tx: std::sync::mpsc::SyncSender<Audio>,
     mut ictx: ffmpeg::format::context::Input,
     video_stream_index: usize,
     audio_stream_index: usize,
     break_flag: std::sync::Arc<std::sync::Mutex<bool>>,
 ) -> std::thread::JoinHandle<Result<()>> {
     std::thread::spawn(move || -> Result<()> {
-        let (audio_tx, audio_rx) = std::sync::mpsc::channel();
-        let (video_tx, video_rx) = std::sync::mpsc::channel();
+        let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel(8);
+        let (video_tx, video_rx) = std::sync::mpsc::sync_channel(8);
 
-        let audio_thread_handle = audio_thread(audio_decoder, audio_rx, decoded_tx.clone());
-        let video_thread_handle = video_thread(video_decoder, video_rx, decoded_tx);
+        let audio_thread_handle = audio_thread(audio_decoder, audio_rx, audio_decoder_tx);
+        let video_thread_handle = video_thread(video_decoder, video_rx, video_decoded_tx);
 
         // читаем все пакеты из потока через av_read_frame()
         for (stream, packet) in ictx.packets() {
@@ -174,8 +204,8 @@ fn packet_receiver(
         drop(audio_tx);
         drop(video_tx);
 
-        audio_thread_handle.join();
-        video_thread_handle.join();
+        audio_thread_handle.join().unwrap()?;
+        video_thread_handle.join().unwrap()?;
 
         Ok(())
     })
@@ -184,7 +214,7 @@ fn packet_receiver(
 fn video_thread(
     mut decoder: ffmpeg::codec::decoder::Video,
     video_rx: std::sync::mpsc::Receiver<std::sync::Arc<ffmpeg::codec::packet::Packet>>,
-    result_tx: std::sync::mpsc::Sender<DecodeResult>,
+    result_tx: std::sync::mpsc::SyncSender<Video>,
 ) -> std::thread::JoinHandle<Result<()>> {
     std::thread::spawn(move || -> Result<()> {
         // определяем из какого формата в какой переводим
@@ -210,9 +240,7 @@ fn video_thread(
                     // переводим фрейм в нужный формат sws_scale()
                     context.run(&decoded, &mut frame_to_display)?;
                     //let frame_to_display = std::sync::Arc::new(frame_to_display);
-                    result_tx
-                        .send(DecodeResult::Video(frame_to_display))
-                        .unwrap_or(());
+                    result_tx.send(frame_to_display).unwrap_or(());
                 }
                 Ok(())
             };
@@ -231,7 +259,7 @@ fn video_thread(
 fn audio_thread(
     mut decoder: ffmpeg::codec::decoder::Audio,
     audio_rx: std::sync::mpsc::Receiver<std::sync::Arc<ffmpeg::codec::packet::Packet>>,
-    result_tx: std::sync::mpsc::Sender<DecodeResult>,
+    result_tx: std::sync::mpsc::SyncSender<Audio>,
 ) -> std::thread::JoinHandle<Result<()>> {
     std::thread::spawn(move || -> Result<()> {
         let mut a_context = AudioContext::get(
@@ -250,9 +278,7 @@ fn audio_thread(
                     let mut frame_to_play = Audio::empty();
                     a_context.run(&decoded, &mut frame_to_play)?;
                     //let frame_to_play = std::sync::Arc::new(frame_to_play);
-                    result_tx
-                        .send(DecodeResult::Audio(frame_to_play))
-                        .unwrap_or(())
+                    result_tx.send(frame_to_play).unwrap_or(())
                 }
                 Ok(())
             };
@@ -261,7 +287,7 @@ fn audio_thread(
             decoder.send_packet(&*packet)?;
             receive_and_process_decoded_frames(&mut decoder)?;
         }
-        decoder.send_eof();
+        decoder.send_eof()?;
 
         Ok(())
     })
